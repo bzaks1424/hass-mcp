@@ -20,6 +20,8 @@ Everything talks to HA through `app.ws.call_ws`, the same authenticated
 request/response primitive used by the statistics tools.
 """
 from typing import Any, Dict, List, Optional, Union
+import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +31,10 @@ from app.ws import call_ws, HassWebSocketError
 from app import config
 
 logger = logging.getLogger(__name__)
+
+# Per-dashboard locks to serialize concurrent writes.
+# Key: url_path (None for the default dashboard).
+_locks: Dict[Optional[str], asyncio.Lock] = {}
 
 # A `view` argument that selects an existing view: an integer index, or a
 # string matched against each view's `path` or `title`.
@@ -52,8 +58,21 @@ class LovelaceError(Exception):
 # Small helpers
 # ---------------------------------------------------------------------------
 
+def _content_hash(cfg: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(cfg, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
 def _label(url_path: Optional[str]) -> str:
     return f"'{url_path}'" if url_path else "(default)"
+
+
+def _get_lock(url_path: Optional[str]) -> asyncio.Lock:
+    key = url_path  # None for default dashboard
+    if key not in _locks:
+        _locks[key] = asyncio.Lock()
+    return _locks[key]
 
 
 def _as_int_or_none(value: Any) -> Optional[int]:
@@ -119,9 +138,16 @@ def _validate_card(card: Any, where: str) -> None:
 def _validate_config(cfg: Any) -> None:
     """Structural-only check. Card *internals* aren't validated — HA core and
     custom cards define open-ended schemas, so we only guard the shape that
-    would otherwise break the dashboard render or our own indexing."""
+    would otherwise break the dashboard render or our own indexing.
+
+    Strategy configs (``{"strategy": {"type": "..."}}``) are accepted by
+    the raw read/write layer but rejected by high-level card/view helpers;
+    they have no views/cards to edit."""
     if not isinstance(cfg, dict):
-        raise LovelaceError("Dashboard config must be a dict containing a 'views' list.")
+        raise LovelaceError("Dashboard config must be a dict.")
+    # Strategy dashboards have no views/cards — valid for raw read/write.
+    if "strategy" in cfg:
+        return
     views = cfg.get("views")
     if not isinstance(views, list):
         raise LovelaceError("Dashboard config must contain a 'views' list.")
@@ -311,20 +337,26 @@ def _resolve_card_list(
 async def _dashboard_mode(url_path: Optional[str]) -> Optional[str]:
     """Best-effort lookup of a dashboard's mode ('storage' / 'yaml').
 
-    Returns None when the mode can't be determined; callers then rely on the
-    reactive guard (translating HA's save error)."""
+    Uses ``lovelace/dashboards/list`` — the only WS command that reliably
+    reports per-dashboard mode across HA versions. For the default dashboard
+    (url_path=None), checks whether a YAML-backed ``"lovelace"`` entry
+    dominates (per ``_handle_errors`` resolution in HA core). Returns None
+    when the mode can't be determined; callers then rely on the reactive
+    guard (translating HA's save error)."""
     try:
-        if url_path is None:
-            info = await call_ws("lovelace/info")
-            if isinstance(info, dict):
-                return info.get("mode") or info.get("resource_mode")
-            return None
         dashboards = await call_ws("lovelace/dashboards/list")
-        for d in dashboards or []:
-            if d.get("url_path") == url_path:
-                return d.get("mode")
     except HassWebSocketError:
         return None
+
+    if url_path is None:
+        for d in dashboards or []:
+            if d.get("url_path") == "lovelace" and d.get("mode") == "yaml":
+                return "yaml"
+        return "storage"
+
+    for d in dashboards or []:
+        if d.get("url_path") == url_path:
+            return d.get("mode")
     return None
 
 
@@ -420,6 +452,19 @@ async def set_dashboard_config(
         raise LovelaceError("config is required.")
     _validate_config(config)
 
+    # Stale snapshot guard: high-level helpers stamp a hash on the config
+    # they read. Before writing, re-read and verify it hasn't changed
+    # underneath us — another client or the HA frontend may have edited it.
+    snapshot_hash = config.pop("_snapshot_hash", None)
+    if snapshot_hash is not None:
+        current = await get_dashboard_config(url_path)
+        current.pop("note", None)
+        if _content_hash(current) != snapshot_hash:
+            raise LovelaceError(
+                "Dashboard config was modified since it was read. "
+                "Please retry the operation."
+            )
+
     if await _dashboard_mode(url_path) == "yaml":
         raise LovelaceError(
             f"Dashboard {_label(url_path)} is in YAML mode and cannot be edited "
@@ -462,9 +507,22 @@ async def set_dashboard_config(
 # ---------------------------------------------------------------------------
 
 async def _load_for_edit(url_path: Optional[str]) -> Dict[str, Any]:
+    """Read a dashboard config for high-level editing.
+
+    Returns the config with an internal ``_snapshot_hash`` stamp used by
+    ``set_dashboard_config`` to detect stale snapshots. Rejects strategy
+    dashboards — those have no views/cards to mutate."""
     cfg = await get_dashboard_config(url_path)
     cfg.pop("note", None)  # internal scaffold marker — never persist it
+    if "strategy" in cfg:
+        raise LovelaceError(
+            f"This dashboard uses a generation strategy "
+            f"(type: {cfg['strategy'].get('type', 'unknown')}). "
+            "Card/view editing is not supported for strategy dashboards. "
+            "Use get_dashboard_config/set_dashboard_config instead."
+        )
     cfg.setdefault("views", [])
+    cfg["_snapshot_hash"] = _content_hash(cfg)
     return cfg
 
 
@@ -483,12 +541,13 @@ async def add_card(
     if card is None:
         raise LovelaceError("card is required.")
     _validate_card(card, "card")
-    cfg = await _load_for_edit(url_path)
-    vi = _resolve_view(cfg, view)
-    cards = _resolve_card_list(cfg["views"][vi], section, vi)
-    idx = len(cards) if position is None else _coerce_position(position, len(cards))
-    cards.insert(idx, card)
-    return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    async with _get_lock(url_path):
+        cfg = await _load_for_edit(url_path)
+        vi = _resolve_view(cfg, view)
+        cards = _resolve_card_list(cfg["views"][vi], section, vi)
+        idx = len(cards) if position is None else _coerce_position(position, len(cards))
+        cards.insert(idx, card)
+        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
 
 
 async def update_card(
@@ -503,12 +562,13 @@ async def update_card(
     if card is None:
         raise LovelaceError("card is required.")
     _validate_card(card, "card")
-    cfg = await _load_for_edit(url_path)
-    vi = _resolve_view(cfg, view)
-    cards = _resolve_card_list(cfg["views"][vi], section, vi)
-    card_index = _coerce_index(card_index, len(cards), "card_index")
-    cards[card_index] = card
-    return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    async with _get_lock(url_path):
+        cfg = await _load_for_edit(url_path)
+        vi = _resolve_view(cfg, view)
+        cards = _resolve_card_list(cfg["views"][vi], section, vi)
+        card_index = _coerce_index(card_index, len(cards), "card_index")
+        cards[card_index] = card
+        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
 
 
 async def remove_card(
@@ -519,12 +579,13 @@ async def remove_card(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Remove the card at `card_index` from `view` (or its `section`)."""
-    cfg = await _load_for_edit(url_path)
-    vi = _resolve_view(cfg, view)
-    cards = _resolve_card_list(cfg["views"][vi], section, vi)
-    card_index = _coerce_index(card_index, len(cards), "card_index")
-    cards.pop(card_index)
-    return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    async with _get_lock(url_path):
+        cfg = await _load_for_edit(url_path)
+        vi = _resolve_view(cfg, view)
+        cards = _resolve_card_list(cfg["views"][vi], section, vi)
+        card_index = _coerce_index(card_index, len(cards), "card_index")
+        cards.pop(card_index)
+        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
 
 
 async def move_card(
@@ -536,14 +597,15 @@ async def move_card(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Reorder a card within a view (or its `section`): `card_index` -> `new_index`."""
-    cfg = await _load_for_edit(url_path)
-    vi = _resolve_view(cfg, view)
-    cards = _resolve_card_list(cfg["views"][vi], section, vi)
-    card_index = _coerce_index(card_index, len(cards), "card_index")
-    new_index = _coerce_index(new_index, len(cards), "new_index")
-    card = cards.pop(card_index)
-    cards.insert(new_index, card)
-    return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    async with _get_lock(url_path):
+        cfg = await _load_for_edit(url_path)
+        vi = _resolve_view(cfg, view)
+        cards = _resolve_card_list(cfg["views"][vi], section, vi)
+        card_index = _coerce_index(card_index, len(cards), "card_index")
+        new_index = _coerce_index(new_index, len(cards), "new_index")
+        card = cards.pop(card_index)
+        cards.insert(new_index, card)
+        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
 
 
 async def list_view_sections(
@@ -584,11 +646,12 @@ async def add_view(
         raise LovelaceError(
             "view_config must be a dict describing the view (e.g. {'title': 'Garage'})."
         )
-    cfg = await _load_for_edit(url_path)
-    views = cfg["views"]
-    idx = len(views) if position is None else _coerce_position(position, len(views))
-    views.insert(idx, view_config)
-    return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    async with _get_lock(url_path):
+        cfg = await _load_for_edit(url_path)
+        views = cfg["views"]
+        idx = len(views) if position is None else _coerce_position(position, len(views))
+        views.insert(idx, view_config)
+        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
 
 
 async def remove_view(
@@ -597,10 +660,11 @@ async def remove_view(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Remove the view selected by `view` (index, path, or title)."""
-    cfg = await _load_for_edit(url_path)
-    vi = _resolve_view(cfg, view)
-    cfg["views"].pop(vi)
-    return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    async with _get_lock(url_path):
+        cfg = await _load_for_edit(url_path)
+        vi = _resolve_view(cfg, view)
+        cfg["views"].pop(vi)
+        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
 
 
 async def update_view(
@@ -617,10 +681,11 @@ async def update_view(
             "changes must be a dict of view properties to update "
             "(e.g. {'title': 'New Title'})."
         )
-    cfg = await _load_for_edit(url_path)
-    vi = _resolve_view(cfg, view)
-    cfg["views"][vi].update(changes)
-    return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    async with _get_lock(url_path):
+        cfg = await _load_for_edit(url_path)
+        vi = _resolve_view(cfg, view)
+        cfg["views"][vi].update(changes)
+        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------

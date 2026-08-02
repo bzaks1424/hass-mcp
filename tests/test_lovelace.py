@@ -10,6 +10,7 @@ Backups are redirected to a pytest tmp_path so the real ~/.hass-mcp dir is
 never touched.
 """
 import copy
+import asyncio
 import json
 import os
 
@@ -39,12 +40,9 @@ class FakeWS:
             {"id": "abc", "url_path": "test-dash", "title": "Test", "mode": "storage"},
             {"id": "def", "url_path": "yaml-dash", "title": "YAML", "mode": "yaml"},
         ]
-        self.info = {"mode": "storage"}
         self.saved = []  # list of (url_path, config) in call order
 
     async def __call__(self, message_type, **payload):
-        if message_type == "lovelace/info":
-            return self.info
         if message_type == "lovelace/dashboards/list":
             return self.dashboards
         if message_type == "lovelace/config":
@@ -461,3 +459,179 @@ async def test_restore_dashboard_round_trip(fake_ws):
 async def test_restore_no_backups_errors(fake_ws):
     with pytest.raises(LovelaceError, match="[Nn]o backups"):
         await lovelace.restore_dashboard("test-dash")
+
+
+# --------------------------------------------------------------------------
+# Strategy configs
+# --------------------------------------------------------------------------
+
+STRATEGY_CONFIG = {"strategy": {"type": "map"}}
+
+
+async def test_set_dashboard_config_accepts_strategy(fake_ws):
+    """Raw set must accept strategy configs (no 'views' key)."""
+    result = await lovelace.set_dashboard_config(None, STRATEGY_CONFIG)
+    assert result["success"] is True
+    assert fake_ws.config_store[None] == STRATEGY_CONFIG
+
+
+async def test_restore_round_trips_strategy(fake_ws):
+    """Save strategy → mutate (triggers backup of strategy) → restore → back to strategy."""
+    await lovelace.set_dashboard_config(None, STRATEGY_CONFIG)
+    # Mutating triggers _backup_current which backs up the current (strategy) config.
+    await lovelace.set_dashboard_config(
+        None, {"views": [{"cards": []}]}
+    )
+    # The newest backup is the pre-mutation strategy config.
+    backups = lovelace.list_dashboard_backups(None)
+    strategy_backup_id = backups[-1]["backup_id"]
+    result = await lovelace.restore_dashboard(
+        None, backup_id=strategy_backup_id
+    )
+    assert result["restored_from"] == strategy_backup_id
+    assert fake_ws.config_store[None] == STRATEGY_CONFIG
+
+
+async def test_add_card_rejects_strategy_dashboard(fake_ws):
+    """High-level helpers must reject strategy configs with clear message."""
+    fake_ws.config_store[None] = STRATEGY_CONFIG
+    with pytest.raises(LovelaceError, match="strategy"):
+        await lovelace.add_card(None, view=0, card={"type": "markdown"})
+
+
+async def test_validation_allows_strategy_without_views(fake_ws):
+    """_validate_config must not require 'views' for strategy configs."""
+    result = await lovelace.set_dashboard_config(
+        None, STRATEGY_CONFIG, dry_run=True
+    )
+    assert result["dry_run"] is True
+
+
+async def test_set_dashboard_config_strategy_backup_works(fake_ws):
+    """Backup of a strategy config before overwrite succeeds."""
+    fake_ws.config_store[None] = STRATEGY_CONFIG
+    result = await lovelace.set_dashboard_config(
+        None, {"views": [{"cards": []}]}
+    )
+    assert result["success"] is True
+    # Backup of the strategy config was written.
+    backup_dir = app_config.HASS_MCP_BACKUP_DIR
+    files = os.listdir(backup_dir)
+    assert len(files) >= 1
+    backups = [f for f in files if f.startswith("lovelace_default_")]
+    with open(os.path.join(backup_dir, backups[-1])) as f:
+        backed_up = json.load(f)
+    assert backed_up == STRATEGY_CONFIG
+
+
+# --------------------------------------------------------------------------
+# Default dashboard mode detection via dashboards/list
+# --------------------------------------------------------------------------
+
+
+async def test_default_dashboard_storage_when_no_lovelace_entry(fake_ws):
+    """No 'lovelace' entry in dashboards/list → default is storage-backed."""
+    # No "lovelace" dashboard → dashboards[None] = LovelaceStorage.
+    result = await lovelace.set_dashboard_config(
+        None, {"views": [{"cards": []}]}
+    )
+    assert result["success"] is True
+
+
+async def test_default_dashboard_yaml_when_lovelace_entry_is_yaml(fake_ws):
+    """'lovelace' entry with mode 'yaml' → default is YAML-backed."""
+    fake_ws.dashboards.append(
+        {"id": "y", "url_path": "lovelace", "title": "Default", "mode": "yaml"}
+    )
+    with pytest.raises(LovelaceError, match="YAML"):
+        await lovelace.set_dashboard_config(None, {"views": []})
+
+
+async def test_default_dashboard_storage_when_lovelace_entry_is_storage(fake_ws):
+    """'lovelace' entry with mode 'storage' → default is storage-backed."""
+    fake_ws.dashboards.append(
+        {"id": "s", "url_path": "lovelace", "title": "Default", "mode": "storage"}
+    )
+    result = await lovelace.set_dashboard_config(
+        None, {"views": [{"cards": []}]}
+    )
+    assert result["success"] is True
+
+
+async def test_named_yaml_dashboard_still_rejected(fake_ws):
+    """Named YAML dashboards should still be detected and rejected."""
+    with pytest.raises(LovelaceError, match="YAML"):
+        await lovelace.set_dashboard_config("yaml-dash", {"views": []})
+
+
+# --------------------------------------------------------------------------
+# Concurrent edits and stale snapshot detection
+# --------------------------------------------------------------------------
+
+
+async def test_concurrent_adds_both_succeed(fake_ws):
+    """Two concurrent add_card calls must not silently lose one."""
+    fake_ws.config_store[None] = {"views": [{"cards": []}]}
+    await asyncio.gather(
+        lovelace.add_card(None, view=0, card={"type": "a"}),
+        lovelace.add_card(None, view=0, card={"type": "b"}),
+    )
+    cfg = fake_ws.config_store[None]
+    types = [c["type"] for c in cfg["views"][0]["cards"]]
+    assert "a" in types
+    assert "b" in types
+    assert len(types) == 2
+
+
+async def test_stale_snapshot_detected_external_modification(fake_ws):
+    """If config changes externally between read and write, detect it."""
+    fake_ws.config_store[None] = {"views": [{"cards": [{"type": "a"}]}]}
+
+    # Read produces a snapshot hash.
+    cfg = await lovelace._load_for_edit(None)
+    # Simulate external modification.
+    fake_ws.config_store[None] = {"views": [{"cards": [{"type": "b"}]}]}
+
+    with pytest.raises(LovelaceError, match="modified"):
+        await lovelace.set_dashboard_config(None, cfg)
+
+
+async def test_direct_set_dashboard_no_stale_check(fake_ws):
+    """Direct set_dashboard_config (no _snapshot_hash) skips stale check."""
+    # A config from the user (MCP tool) has no _snapshot_hash stamp.
+    cfg = {"views": [{"cards": [{"type": "x"}]}]}
+    # External modification should NOT block a direct set.
+    fake_ws.config_store[None] = {"views": [{"cards": [{"type": "y"}]}]}
+    result = await lovelace.set_dashboard_config(None, cfg)
+    assert result["success"] is True
+    assert fake_ws.config_store[None] == cfg
+
+
+async def test_remove_view_locked_against_concurrent_card_op(fake_ws):
+    """Lock serializes view mutations and card ops on same dashboard."""
+    fake_ws.config_store[None] = {
+        "views": [
+            {"title": "A", "cards": [{"type": "a"}]},
+            {"title": "B", "cards": [{"type": "b"}]},
+        ]
+    }
+    await asyncio.gather(
+        lovelace.remove_view(None, view="B"),
+        lovelace.add_card(None, view="A", card={"type": "c"}),
+    )
+    cfg = fake_ws.config_store[None]
+    assert len(cfg["views"]) == 1
+    types = [c["type"] for c in cfg["views"][0]["cards"]]
+    assert "a" in types
+    assert "c" in types
+
+
+async def test_stale_snapshot_reported_on_identical_content_from_lovelace_info(fake_ws):
+    """Regression: the stale check re-reads via get_dashboard_config (which
+    pops 'note'), so the hash comparison must be consistent with how
+    _load_for_edit stamps it."""
+    fake_ws.config_store[None] = {"views": [{"cards": [{"type": "a"}]}]}
+    cfg = await lovelace._load_for_edit(None)
+    # No external change → snapshot should NOT be stale.
+    result = await lovelace.set_dashboard_config(None, cfg)
+    assert result["success"] is True
