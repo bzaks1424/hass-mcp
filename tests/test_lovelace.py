@@ -46,7 +46,7 @@ class FakeWS:
         if message_type == "lovelace/dashboards/list":
             return self.dashboards
         if message_type == "lovelace/config":
-            url_path = payload.get("url_path")
+            url_path = self._resolve(payload.get("url_path"))
             if url_path in self.config_store:
                 # HA returns freshly-deserialized JSON each call — never an
                 # alias of caller-held state. Deep-copy to model that.
@@ -56,11 +56,22 @@ class FakeWS:
                 "{'code': 'config_not_found', 'message': 'No config found.'}"
             )
         if message_type == "lovelace/config/save":
-            url_path = payload.get("url_path")
+            url_path = self._resolve(payload.get("url_path"))
             self.saved.append((url_path, copy.deepcopy(payload["config"])))
             self.config_store[url_path] = copy.deepcopy(payload["config"])
             return None
         raise AssertionError(f"unexpected WS message type: {message_type}")
+
+    def _resolve(self, url_path):
+        """HA resolves an omitted url_path to the 'lovelace' dashboard when one
+        exists (lovelace/websocket.py) — model that so alias interleavings
+        are tested faithfully."""
+        if url_path is not None:
+            return url_path
+        for d in self.dashboards:
+            if d.get("url_path") == "lovelace":
+                return "lovelace"
+        return url_path
 
 
 @pytest.fixture
@@ -69,6 +80,16 @@ def fake_ws(monkeypatch, tmp_path):
     monkeypatch.setattr("app.lovelace.call_ws", fake)
     monkeypatch.setattr("app.config.HASS_MCP_BACKUP_DIR", str(tmp_path))
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _fresh_locks():
+    """Each test gets a fresh per-dashboard lock registry. The module-level
+    dict would otherwise hand out locks bound to a previous test's event
+    loop (a contended acquire binds the loop)."""
+    lovelace._locks.clear()
+    yield
+    lovelace._locks.clear()
 
 
 # --------------------------------------------------------------------------
@@ -635,3 +656,76 @@ async def test_stale_snapshot_reported_on_identical_content_from_lovelace_info(f
     # No external change → snapshot should NOT be stale.
     result = await lovelace.set_dashboard_config(None, cfg)
     assert result["success"] is True
+
+
+# --------------------------------------------------------------------------
+# Lock canonicalization: None (default) ≡ "lovelace" dashboard
+# --------------------------------------------------------------------------
+
+
+async def test_default_alias_lovelace_shares_lock_key(fake_ws):
+    """HA resolves an omitted url_path to the 'lovelace' dashboard when one
+    exists — None and 'lovelace' must resolve to the SAME lock, or
+    interleaved edits on the default dashboard could silently overwrite."""
+    fake_ws.dashboards.append(
+        {"id": "lov", "url_path": "lovelace", "title": "Default", "mode": "storage"}
+    )
+    assert await lovelace._lock_for(None) is await lovelace._lock_for("lovelace")
+
+
+async def test_interleaved_alias_edits_both_succeed(fake_ws):
+    """Regression: add_card(None) racing add_card('lovelace') on the same
+    (default) dashboard must both succeed — a torn read-modify-write
+    previously returned success twice while losing one card."""
+    fake_ws.dashboards.append(
+        {"id": "lov", "url_path": "lovelace", "title": "Default", "mode": "storage"}
+    )
+    fake_ws.config_store["lovelace"] = {"views": [{"cards": []}]}
+    await asyncio.gather(
+        lovelace.add_card(None, view=0, card={"type": "a"}),
+        lovelace.add_card("lovelace", view=0, card={"type": "b"}),
+    )
+    cfg = fake_ws.config_store["lovelace"]
+    types = [c["type"] for c in cfg["views"][0]["cards"]]
+    assert "a" in types
+    assert "b" in types
+    assert len(types) == 2
+
+
+async def test_raw_set_dashboard_config_takes_the_lock(fake_ws):
+    """Regression: raw set_dashboard_config must take the same per-dashboard
+    lock as the high-level helpers — a raw write between a helper's read and
+    save would otherwise be silently overwritten."""
+    fake_ws.config_store[None] = {"views": [{"cards": [{"type": "orig"}]}]}
+    raw_cfg = {"views": [{"cards": [{"type": "raw"}]}]}
+    lock = await lovelace._lock_for(None)
+    async with lock:  # a concurrent high-level edit holds the lock...
+        task = asyncio.create_task(lovelace.set_dashboard_config(None, raw_cfg))
+        for _ in range(200):
+            if task.done():
+                break
+            await asyncio.sleep(0)
+        assert not task.done(), "raw set completed while the lock was held"
+    # ...once released, the raw write lands.
+    await task
+    assert fake_ws.config_store[None] == raw_cfg
+
+
+async def test_restore_dashboard_takes_the_lock(fake_ws):
+    """Regression: restore_dashboard saves through the same per-dashboard
+    lock — it must not interleave between a helper's read and save."""
+    original = {"views": [{"title": "Home", "cards": []}]}
+    assert fake_ws.config_store[None] == original
+    await lovelace.add_card(None, view=0, card={"type": "markdown", "content": "1"})
+    assert lovelace.list_dashboard_backups(None)
+
+    lock = await lovelace._lock_for(None)
+    async with lock:
+        task = asyncio.create_task(lovelace.restore_dashboard(None))
+        for _ in range(200):
+            if task.done():
+                break
+            await asyncio.sleep(0)
+        assert not task.done(), "restore completed while the lock was held"
+    await task
+    assert fake_ws.config_store[None] == original

@@ -33,8 +33,10 @@ from app import config
 logger = logging.getLogger(__name__)
 
 # Per-dashboard locks to serialize concurrent writes.
-# Key: url_path (None for the default dashboard).
-_locks: Dict[Optional[str], asyncio.Lock] = {}
+# Key: canonicalized url_path — `None` (the default dashboard) maps to
+# "lovelace" when a "lovelace" dashboard exists, because HA resolves an
+# omitted url_path to it.
+_locks: Dict[str, asyncio.Lock] = {}
 
 # A `view` argument that selects an existing view: an integer index, or a
 # string matched against each view's `path` or `title`.
@@ -68,8 +70,29 @@ def _label(url_path: Optional[str]) -> str:
     return f"'{url_path}'" if url_path else "(default)"
 
 
-def _get_lock(url_path: Optional[str]) -> asyncio.Lock:
-    key = url_path  # None for default dashboard
+async def _canonical_lock_key(url_path: Optional[str]) -> str:
+    """Resolve a dashboard selector to its stable per-dashboard lock key.
+
+    Matches HA's own resolution (lovelace/websocket.py): an omitted
+    ``url_path`` addresses the ``"lovelace"`` dashboard when one exists, so
+    ``None`` and ``"lovelace"`` must share a lock — interleaved edits on the
+    same dashboard would otherwise silently overwrite each other. When no
+    "lovelace" dashboard exists the default keeps its own key."""
+    if url_path is not None:
+        return url_path
+    try:
+        dashboards = await call_ws("lovelace/dashboards/list")
+    except HassWebSocketError:
+        return "lovelace"
+    for d in dashboards or []:
+        if d.get("url_path") == "lovelace":
+            return "lovelace"
+    return "default"
+
+
+async def _lock_for(url_path: Optional[str]) -> asyncio.Lock:
+    """Return the per-dashboard lock for a dashboard selector."""
+    key = await _canonical_lock_key(url_path)
     if key not in _locks:
         _locks[key] = asyncio.Lock()
     return _locks[key]
@@ -444,10 +467,24 @@ async def set_dashboard_config(
 ) -> Dict[str, Any]:
     """Overwrite a dashboard's full config — the single write choke point.
 
+    Takes the per-dashboard lock first, so a raw write serializes against
+    high-level card/view edits on the same dashboard (they share this
+    function's locked body).
+
     Enforces, in order: structural validation, YAML-mode rejection, dry-run
     preview, then backup-before-save. ⚠️ This replaces the ENTIRE dashboard
     config and is reflected live in every open browser. The prior config is
     backed up first (see `restore_dashboard`)."""
+    async with await _lock_for(url_path):
+        return await _set_dashboard_config_locked(url_path, config, dry_run=dry_run)
+
+
+async def _set_dashboard_config_locked(
+    url_path: Optional[str],
+    config: Optional[Dict[str, Any]],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Locked body of set_dashboard_config — callers must hold the lock."""
     if config is None:
         raise LovelaceError("config is required.")
     _validate_config(config)
@@ -541,13 +578,13 @@ async def add_card(
     if card is None:
         raise LovelaceError("card is required.")
     _validate_card(card, "card")
-    async with _get_lock(url_path):
+    async with await _lock_for(url_path):
         cfg = await _load_for_edit(url_path)
         vi = _resolve_view(cfg, view)
         cards = _resolve_card_list(cfg["views"][vi], section, vi)
         idx = len(cards) if position is None else _coerce_position(position, len(cards))
         cards.insert(idx, card)
-        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+        return await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
 
 
 async def update_card(
@@ -562,13 +599,13 @@ async def update_card(
     if card is None:
         raise LovelaceError("card is required.")
     _validate_card(card, "card")
-    async with _get_lock(url_path):
+    async with await _lock_for(url_path):
         cfg = await _load_for_edit(url_path)
         vi = _resolve_view(cfg, view)
         cards = _resolve_card_list(cfg["views"][vi], section, vi)
         card_index = _coerce_index(card_index, len(cards), "card_index")
         cards[card_index] = card
-        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+        return await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
 
 
 async def remove_card(
@@ -579,13 +616,13 @@ async def remove_card(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Remove the card at `card_index` from `view` (or its `section`)."""
-    async with _get_lock(url_path):
+    async with await _lock_for(url_path):
         cfg = await _load_for_edit(url_path)
         vi = _resolve_view(cfg, view)
         cards = _resolve_card_list(cfg["views"][vi], section, vi)
         card_index = _coerce_index(card_index, len(cards), "card_index")
         cards.pop(card_index)
-        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+        return await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
 
 
 async def move_card(
@@ -597,7 +634,7 @@ async def move_card(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Reorder a card within a view (or its `section`): `card_index` -> `new_index`."""
-    async with _get_lock(url_path):
+    async with await _lock_for(url_path):
         cfg = await _load_for_edit(url_path)
         vi = _resolve_view(cfg, view)
         cards = _resolve_card_list(cfg["views"][vi], section, vi)
@@ -605,7 +642,7 @@ async def move_card(
         new_index = _coerce_index(new_index, len(cards), "new_index")
         card = cards.pop(card_index)
         cards.insert(new_index, card)
-        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+        return await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
 
 
 async def list_view_sections(
@@ -646,12 +683,12 @@ async def add_view(
         raise LovelaceError(
             "view_config must be a dict describing the view (e.g. {'title': 'Garage'})."
         )
-    async with _get_lock(url_path):
+    async with await _lock_for(url_path):
         cfg = await _load_for_edit(url_path)
         views = cfg["views"]
         idx = len(views) if position is None else _coerce_position(position, len(views))
         views.insert(idx, view_config)
-        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+        return await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
 
 
 async def remove_view(
@@ -660,11 +697,11 @@ async def remove_view(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Remove the view selected by `view` (index, path, or title)."""
-    async with _get_lock(url_path):
+    async with await _lock_for(url_path):
         cfg = await _load_for_edit(url_path)
         vi = _resolve_view(cfg, view)
         cfg["views"].pop(vi)
-        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+        return await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
 
 
 async def update_view(
@@ -681,11 +718,11 @@ async def update_view(
             "changes must be a dict of view properties to update "
             "(e.g. {'title': 'New Title'})."
         )
-    async with _get_lock(url_path):
+    async with await _lock_for(url_path):
         cfg = await _load_for_edit(url_path)
         vi = _resolve_view(cfg, view)
         cfg["views"][vi].update(changes)
-        return await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+        return await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +765,9 @@ async def restore_dashboard(
             )
     with open(chosen["path"]) as f:
         cfg = json.load(f)
-    result = await set_dashboard_config(url_path, cfg, dry_run=dry_run)
+    # Backup files are immutable, so the read is safe outside the lock; the
+    # save itself must serialize against concurrent edits.
+    async with await _lock_for(url_path):
+        result = await _set_dashboard_config_locked(url_path, cfg, dry_run=dry_run)
     result["restored_from"] = chosen["backup_id"]
     return result

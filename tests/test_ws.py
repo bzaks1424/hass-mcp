@@ -64,9 +64,10 @@ def _patch_connect(monkeypatch, fake: _FakeWebSocket) -> dict:
     """Replace `websockets.connect` so it yields our fake."""
     captured: dict = {}
 
-    def fake_connect(url, ssl=None):
+    def fake_connect(url, ssl=None, max_size=None):
         captured["url"] = url
         captured["ssl"] = ssl
+        captured["max_size"] = max_size
         return fake
 
     monkeypatch.setattr("app.ws.websockets.connect", fake_connect)
@@ -91,6 +92,9 @@ async def test_call_ws_happy_path(monkeypatch):
 
     # ws:// because HA_URL is http://localhost:8123 in conftest.
     assert captured["url"] == "ws://localhost:8123/api/websocket"
+    # Large dashboard configs exceed websockets' 1 MiB default — the client
+    # must pass max_size=None to match HA's WS message limits.
+    assert captured["max_size"] is None
 
     # Auth + request both sent, in order.
     assert len(fake.received) == 2
