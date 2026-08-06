@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-06
+
+### Added
+- Live Lovelace dashboard editing over Home Assistant's WebSocket API. Thirteen
+  new MCP tools can list, read, and update dashboards, cards, views, and
+  sections, with dry-run previews and automatic backup and restore support.
+  Storage-mode checks, strategy-dashboard handling, stale-snapshot detection,
+  and per-dashboard write locks protect whole-config writes from unsupported
+  modes and lost updates. Thanks to @cstosgale for building the feature and
+  patiently working through the correctness review. ([#67])
+
 ## [0.5.0] - 2026-06-23
 
 ### Added
@@ -139,7 +150,8 @@ functional changes.
 
 Initial PyPI release.
 
-[Unreleased]: https://github.com/voska/hass-mcp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/voska/hass-mcp/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/voska/hass-mcp/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/voska/hass-mcp/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/voska/hass-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/voska/hass-mcp/compare/v0.3.0...v0.4.0
@@ -159,3 +171,4 @@ Initial PyPI release.
 [#33]: https://github.com/voska/hass-mcp/pull/33
 [#34]: https://github.com/voska/hass-mcp/pull/34
 [#35]: https://github.com/voska/hass-mcp/issues/35
+[#67]: https://github.com/voska/hass-mcp/pull/67
