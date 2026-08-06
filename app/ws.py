@@ -52,7 +52,9 @@ async def call_ws(message_type: str, **payload: Any) -> Any:
     url = _ws_url()
     ssl_ctx = _build_ssl_context() if url.startswith("wss://") else None
 
-    async with websockets.connect(url, ssl=ssl_ctx) as ws:
+    async with websockets.connect(
+        url, ssl=ssl_ctx, max_size=None,  # Match HA's WS message limits
+    ) as ws:
         # 1. Server sends auth_required first.
         auth_required = json.loads(await ws.recv())
         if auth_required.get("type") != "auth_required":

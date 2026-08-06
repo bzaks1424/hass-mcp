@@ -77,6 +77,20 @@ EXPECTED_TOOLS = {
     "restart_ha",
     "search_entities_tool",
     "system_overview",
+    # Dashboard (Lovelace) editing
+    "list_dashboards",
+    "get_dashboard_config",
+    "set_dashboard_config",
+    "add_card",
+    "update_card",
+    "remove_card",
+    "move_card",
+    "add_view",
+    "remove_view",
+    "update_view",
+    "list_view_sections",
+    "list_dashboard_backups",
+    "restore_dashboard",
 }
 
 
