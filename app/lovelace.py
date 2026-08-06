@@ -361,6 +361,13 @@ async def _dashboard_mode(url_path: Optional[str]) -> Optional[str]:
     return None
 
 
+def _backup_prefix(url_path: Optional[str]) -> str:
+    """Return a collision-free filename prefix for one dashboard selector."""
+    if url_path is None:
+        return "lovelace_default_"
+    return f"lovelace_path_{url_path.encode('utf-8').hex()}_"
+
+
 async def _backup_current(url_path: Optional[str]) -> Optional[str]:
     """Write the dashboard's current config to the backup dir. Returns the
     backup id (filename), or None if there's nothing stored to back up."""
@@ -377,8 +384,7 @@ async def _backup_current(url_path: Optional[str]) -> Optional[str]:
     backups_dir = config.HASS_MCP_BACKUP_DIR
     os.makedirs(backups_dir, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-    slug = url_path if url_path else "default"
-    backup_id = f"lovelace_{slug}_{stamp}.json"
+    backup_id = f"{_backup_prefix(url_path)}{stamp}.json"
     with open(os.path.join(backups_dir, backup_id), "w") as f:
         json.dump(current, f, indent=2)
     return backup_id
@@ -712,8 +718,7 @@ def list_dashboard_backups(url_path: Optional[str] = None) -> List[Dict[str, str
     backups_dir = config.HASS_MCP_BACKUP_DIR
     if not os.path.isdir(backups_dir):
         return []
-    slug = url_path if url_path else "default"
-    prefix = f"lovelace_{slug}_"
+    prefix = _backup_prefix(url_path)
     out = []
     for name in sorted(os.listdir(backups_dir)):
         if name.startswith(prefix) and name.endswith(".json"):

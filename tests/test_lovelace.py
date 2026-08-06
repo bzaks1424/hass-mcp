@@ -477,6 +477,27 @@ async def test_restore_dashboard_round_trip(fake_ws):
     assert fake_ws.config_store[None] == original
 
 
+async def test_backups_are_namespaced_by_dashboard_selector(fake_ws):
+    originals = {
+        None: {"views": [{"title": "Overview", "cards": []}]},
+        "default": {"views": [{"title": "Named default", "cards": []}]},
+        "foo": {"views": [{"title": "Foo", "cards": []}]},
+        "foo_bar": {"views": [{"title": "Foo bar", "cards": []}]},
+    }
+    fake_ws.config_store.update(originals)
+
+    for selector in originals:
+        await lovelace.set_dashboard_config(
+            selector, {"views": [{"title": "Changed", "cards": []}]}
+        )
+
+    for selector, original in originals.items():
+        backups = lovelace.list_dashboard_backups(selector)
+        assert len(backups) == 1
+        with open(backups[0]["path"]) as f:
+            assert json.load(f) == original
+
+
 async def test_restore_no_backups_errors(fake_ws):
     with pytest.raises(LovelaceError, match="[Nn]o backups"):
         await lovelace.restore_dashboard("test-dash")
