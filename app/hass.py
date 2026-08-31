@@ -429,6 +429,17 @@ async def get_automations() -> List[Dict[str, Any]]:
     return result
 
 @handle_api_errors
+async def get_automation_config(automation_id: str) -> Dict[str, Any]:
+    """Get the raw configuration of a specific automation"""
+    client = await get_client()
+    response = await client.get(
+        f"{HA_URL}/api/config/automation/config/{automation_id}", 
+        headers=get_ha_headers()
+    )
+    response.raise_for_status()
+    return response.json()
+
+@handle_api_errors
 async def reload_automations() -> Dict[str, Any]:
     """Reload all automations in Home Assistant"""
     return await call_service("automation", "reload", {})

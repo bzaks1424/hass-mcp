@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 from app.hass import (
     get_hass_version, get_entity_state, call_service, get_entities,
-    get_automations, restart_home_assistant, 
+    get_automations, get_automation_config, restart_home_assistant, 
     cleanup_client, filter_fields, summarize_domain, get_system_overview,
     get_hass_error_log, get_entity_history
 )
@@ -56,6 +56,21 @@ async def get_version() -> str:
     """
     logger.info("Getting Home Assistant version")
     return await get_hass_version()
+
+@mcp.tool()
+@async_handler("get_automation_config")
+async def get_automation_config_tool(automation_id: str) -> Dict[str, Any]:
+    """
+    Get the raw configuration for a specific automation
+    
+    Args:
+        automation_id: The ID of the automation (e.g. '1701743566556')
+        
+    Returns:
+        The raw configuration dictionary
+    """
+    logger.info(f"Getting automation config for: {automation_id}")
+    return await get_automation_config(automation_id)
 
 @mcp.tool()
 @async_handler("get_entity")
