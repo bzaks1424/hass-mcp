@@ -40,7 +40,8 @@ python_functions = "test_*"
 log_cli = true
 log_cli_level = "INFO"
 markers = [
-    "asyncio: Tests that use asyncio"
+    "asyncio: Tests that use asyncio",
+    "local: Tests for fork-local features with no upstream counterpart; run with -m local after every catch-up"
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

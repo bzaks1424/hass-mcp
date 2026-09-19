@@ -77,6 +77,7 @@ EXPECTED_TOOLS = {
     "restart_ha",
     "search_entities_tool",
     "system_overview",
+    "get_automation_config_tool",  # fork-local, see app/local_automation_config.py
     # Dashboard (Lovelace) editing
     "list_dashboards",
     "get_dashboard_config",

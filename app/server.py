@@ -1801,3 +1801,7 @@ async def get_error_log(
         search_term=search_term,
         lines=lines,
     )
+
+# fork-local (bzaks1424/hass-mcp): get_automation_config_tool, see app/local_automation_config.py
+from app.local_automation_config import register as _register_local  # noqa: E402
+get_automation_config_tool = _register_local(mcp, async_handler)
